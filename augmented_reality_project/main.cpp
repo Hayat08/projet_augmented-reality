@@ -1,4 +1,3 @@
-
 #include "opencv2/core.hpp"
 #include "opencv2/imgcodecs.hpp"
 #include "opencv2/imgproc.hpp"
@@ -10,141 +9,178 @@
 
 #include <iostream>
 #include <fstream>
-#include <sstream>
 #include <algorithm>
-#include <map>
 
 using namespace cv;
 using namespace std;
 
 
+// ======================================================
+// 1. PARAMETRES
+// ======================================================
+
 string dossierRef = "Reference Images-20261114/";
-
-
+string dossierVideo = "Overlay Videos-20261114/";
 
 string nomsRef[] = {
-    "1-Toyota.png",
-    "2-BMW.jpg",
-    "3-Honda.png"
+    "1-Toyota", "2-BMW", "3-Honda", "4-Suzuki",
+    "5-Peugeot", "6-Volkswagen", "7-Ford", "8-Hyundai",
+    "9-Mercedes", "10-Citroen", "11-Range-Rover", "12-Nissan"
 };
 
-int largeurTraitement = 640;
+// Citroen et Range-Rover : numerotation video inversee
+string nomsVideo[] = {
+    "1-Toyota", "2-BMW", "3-Honda", "4-Suzuki",
+    "5-Peugeot", "6-Volkswagen", "7-Ford", "8-Hyundai",
+    "9-Mercedes", "11-Citroen", "10-Range-Rover", "12-Nissan"
+};
 
-// Nombre minimum de correspondances
-int seuilAppariements = 10;
+int largeurTraitement = 640;     // largeur de la frame webcam traitee
+int tailleMaxRef = 480;     // les references sont reduites (plus rapide)
+int largeurVideoIncr = 320;     // les videos sont reduites avant incrustation
 
-// Nombre minimum de vrais positifs RANSAC
-int seuilVraisPositifs = 8;
+int seuilAppariements = 10;      // correspondances minimum avant RANSAC
+int seuilVraisPositifs = 12;     // inliers RANSAC minimum pour une detection
+int seuilInliersSuivi = 8;      // inliers minimum pour continuer le suivi
+double seuilFlot = 40;           // deplacement max d'un coin entre 2 images
 
-// Seuil de deplacement des coins pour le tracking
-double seuilFlot = 40;
+int periodeDetection = 2;        // detection toutes les N images
+int maxDetectionsParImage = 3;   // nb max de references testees par image (round-robin)
 
-// Detection a chaque image
-int periodeDetection = 1;
+bool afficherContours = true;
 
 
 // ======================================================
 // 2. STRUCTURES
 // ======================================================
 
-// Informations d'une image de reference
-
 struct Cible
 {
     string nom;
 
-    Mat image;
-
+    Mat image;                       // reference (redimensionnee)
     vector<KeyPoint> kp;
     Mat desc;
 
-    bool visible;
-    bool tracking;
-
+    bool visible = false;
+    bool tracking = false;
     string mode;
-
-    int nbAppariements;
+    int nbAppariements = 0;
 
     vector<Point2f> sommets;
     vector<Point2f> prevSommets;
+    Mat H;
+
+    // Points suivis par flot optique (coordonnees ref <-> scene)
+    vector<Point2f> ptsRef;
+    vector<Point2f> ptsScene;
+
+    // Video de recalage
+    Ptr<VideoCapture> video;
+    Mat frameVideo;
+    Mat masqueBlanc;
+    double fpsVideo = 25;
+    double dernierMs = 0;
 };
-
-
-// Resultat transmis a la partie recalage
 
 struct ResultatDetection
 {
     int id;
     bool detected;
-
     vector<Point2f> corners;
     Mat homography;
 };
 
-
-// Donnees globales
-
 vector<Cible> cibles;
 
 Ptr<Feature2D> detecteur;
+Ptr<BFMatcher> matcher;
+string nomAlgo;
 
 VideoCapture cap;
 
-Mat prevGris;
+vector<Mat> prevPyr, currPyr;
+bool prevPyrValide = false;
+const Size winLK(21, 21);
+const int niveauxLK = 3;
 
 int imageCourante = 0;
+int curseurDetection = 0;
 
 
 // ======================================================
 // 3. OUTILS
 // ======================================================
 
-// Convertir les points flottants en points entiers
-
-vector<Point> versPoints(
-    const vector<Point2f>& pts)
+vector<Point> versPoints(const vector<Point2f>& pts)
 {
     vector<Point> res;
-
+    res.reserve(pts.size());
     for (size_t i = 0; i < pts.size(); i++)
-    {
-        res.push_back(
-            Point(
-                (int)pts[i].x,
-                (int)pts[i].y
-            )
-        );
-    }
-
+        res.push_back(Point((int)pts[i].x, (int)pts[i].y));
     return res;
 }
 
-
-// Remplir une zone pour eviter les detections en double
-
-void remplirZone(
-    Mat& masque,
-    const vector<Point2f>& sommets)
+void remplirZone(Mat& masque, const vector<Point2f>& sommets)
 {
-    vector<vector<Point> > polygones;
-
-    polygones.push_back(versPoints(sommets));
-
-    fillPoly(
-        masque,
-        polygones,
-        Scalar(255)
-    );
+    vector<vector<Point> > polys;
+    polys.push_back(versPoints(sommets));
+    fillPoly(masque, polys, Scalar(255));
 }
-
-
-// Mesurer le temps d'execution
 
 double tempsEcoule(double t0)
 {
-    return (
-        (double)getTickCount() - t0
-        ) / getTickFrequency() * 1000;
+    return ((double)getTickCount() - t0) / getTickFrequency() * 1000;
+}
+
+// Ajoute un separateur final si le dossier n'en a pas
+string avecSeparateur(const string& dossier)
+{
+    if (dossier.empty())
+        return dossier;
+
+    char dernier = dossier[dossier.size() - 1];
+
+    if (dernier == '/' || dernier == '\\')
+        return dossier;
+
+    return dossier + "/";
+}
+
+string trouverFichier(const string& dossier, const string& base,
+    const vector<string>& extensions)
+{
+    for (size_t i = 0; i < extensions.size(); i++)
+    {
+        string chemin = avecSeparateur(dossier) + base + extensions[i];
+        ifstream f(chemin.c_str());
+        if (f.good())
+            return chemin;
+    }
+    return "";
+}
+
+// Recadrage centre au ratio voulu, puis reduction
+Mat preparerVideo(const Mat& v, double ratio, int largeurCible)
+{
+    double r = (double)v.cols / v.rows;
+    Rect roi(0, 0, v.cols, v.rows);
+
+    if (r > ratio)
+    {
+        int w = (int)(v.rows * ratio);
+        roi = Rect((v.cols - w) / 2, 0, w, v.rows);
+    }
+    else
+    {
+        int h = (int)(v.cols / ratio);
+        roi = Rect(0, (v.rows - h) / 2, v.cols, h);
+    }
+
+    Mat res;
+    Size s(largeurCible, max(1, (int)(largeurCible / ratio)));
+    resize(v(roi), res, s, 0, 0, INTER_AREA);
+    return res;
 }
 
 
@@ -159,24 +195,18 @@ bool choisirDetecteur()
     cout << "\n================================\n";
     cout << " RECONNAISSANCE MULTI-IMAGES\n";
     cout << "================================\n";
-
-    cout << "1 - ORB\n";
-    cout << "2 - AKAZE\n";
-
-    cout << "Votre choix : ";
+    cout << "1 - ORB\n2 - AKAZE\nVotre choix : ";
     cin >> choix;
 
     if (choix == 1)
     {
-        detecteur = ORB::create(1500);
-
-        cout << "Algorithme ORB selectionne.\n";
+        detecteur = ORB::create(1000);
+        nomAlgo = "ORB";
     }
     else if (choix == 2)
     {
         detecteur = AKAZE::create();
-
-        cout << "Algorithme AKAZE selectionne.\n";
+        nomAlgo = "AKAZE";
     }
     else
     {
@@ -184,95 +214,88 @@ bool choisirDetecteur()
         return false;
     }
 
+    // ORB et AKAZE : descripteurs binaires -> Hamming
+    matcher = makePtr<BFMatcher>(NORM_HAMMING);
+
+    cout << "Algorithme " << nomAlgo << " selectionne.\n";
     return true;
 }
 
 
 // ======================================================
-// 5. CALCUL DES CARACTERISTIQUES
+// 5. CARACTERISTIQUES (sur image deja en niveaux de gris)
 // ======================================================
 
-void calculerCaracteristiques(
-    const Mat& img,
-    vector<KeyPoint>& kp,
-    Mat& desc)
+void calculerCaracteristiques(const Mat& gris, InputArray masque,
+    vector<KeyPoint>& kp, Mat& desc)
 {
-    Mat gris;
-
-    cvtColor(
-        img,
-        gris,
-        COLOR_BGR2GRAY
-    );
-
-    // Detection et calcul des descripteurs
-
-    detecteur->detectAndCompute(
-        gris,
-        noArray(),
-        kp,
-        desc
-    );
+    detecteur->detectAndCompute(gris, masque, kp, desc);
 }
 
 
 // ======================================================
-// 6. CHARGEMENT DES IMAGES DE REFERENCE
+// 6. CHARGEMENT DES REFERENCES ET VIDEOS
 // ======================================================
 
 bool chargerReferences()
 {
-    int nbRef =
-        sizeof(nomsRef) / sizeof(nomsRef[0]);
+    int nbRef = sizeof(nomsRef) / sizeof(nomsRef[0]);
 
     for (int i = 0; i < nbRef; i++)
     {
         Cible c;
-
         c.nom = nomsRef[i];
 
-        // Charger l'image
+        string cheminImg = trouverFichier(
+            dossierRef, nomsRef[i], { ".png", ".jpg", ".jpeg", ".webp" });
 
-        c.image = imread(
-            dossierRef + nomsRef[i]
-        );
+        Mat img = cheminImg.empty() ? Mat() : imread(cheminImg);
 
-        if (c.image.empty())
+        if (img.empty())
         {
-            cerr << "Image introuvable : "
-                << nomsRef[i] << endl;
-
+            cerr << "Image introuvable : " << avecSeparateur(dossierRef) + nomsRef[i] << endl;
             return false;
         }
 
-        // Calculer les points et descripteurs
-
-        calculerCaracteristiques(
-            c.image,
-            c.kp,
-            c.desc
-        );
-
-        if (c.desc.empty() ||
-            c.kp.size() < seuilAppariements)
+        // Reduire la reference si elle est grande
+        int mx = max(img.cols, img.rows);
+        if (mx > tailleMaxRef)
         {
-            cerr << "Pas assez de points dans : "
-                << c.nom << endl;
+            double s = (double)tailleMaxRef / mx;
+            resize(img, img, Size(), s, s, INTER_AREA);
+        }
+        c.image = img;
 
+        Mat gris;
+        cvtColor(c.image, gris, COLOR_BGR2GRAY);
+        calculerCaracteristiques(gris, noArray(), c.kp, c.desc);
+
+        if (c.desc.empty() || (int)c.kp.size() < seuilAppariements)
+        {
+            cerr << "Pas assez de points dans : " << c.nom << endl;
             return false;
         }
 
-        c.visible = false;
-        c.tracking = false;
-        c.nbAppariements = 0;
+        string cheminVid = trouverFichier(
+            dossierVideo, nomsVideo[i], { ".mp4", ".avi", ".mov", ".mkv", ".wmv" });
+
+        c.video = makePtr<VideoCapture>(cheminVid);
+
+        if (cheminVid.empty() || !c.video->isOpened())
+        {
+            cerr << "Video introuvable ou illisible : "
+                << avecSeparateur(dossierVideo) + nomsVideo[i] << endl;
+            return false;
+        }
+
+        c.fpsVideo = max(1.0, c.video->get(CAP_PROP_FPS));
+        c.dernierMs = 0;
 
         cibles.push_back(c);
 
-        cout << "Reference chargee : "
-            << c.nom
-            << " | Points : "
-            << c.kp.size()
-            << endl;
+        cout << "Reference chargee : " << c.nom
+            << " | Points : " << c.kp.size()
+            << " | Video : " << nomsVideo[i] << endl;
     }
 
     return true;
@@ -280,14 +303,12 @@ bool chargerReferences()
 
 
 // ======================================================
-// 7. APPARIEMENT DES DESCRIPTEURS
+// 7. APPARIEMENT (ratio de Lowe)
 // ======================================================
 
-int appariement(
-    const Cible& c,
+int appariement(const Cible& c,
     const Mat& descScene,
     const vector<KeyPoint>& kpScene,
-    const Mat& occupe,
     vector<Point2f>& ptsRef,
     vector<Point2f>& ptsScene)
 {
@@ -297,49 +318,18 @@ int appariement(
     if (descScene.empty() || c.desc.empty())
         return 0;
 
-    // ORB et AKAZE par defaut utilisent
-    // des descripteurs binaires.
-
-    BFMatcher matcher(NORM_HAMMING);
-
     vector<vector<DMatch> > knn;
-
-    matcher.knnMatch(
-        c.desc,
-        descScene,
-        knn,
-        2
-    );
-
-    // Filtrage des correspondances
+    matcher->knnMatch(c.desc, descScene, knn, 2);
 
     for (size_t i = 0; i < knn.size(); i++)
     {
         if (knn[i].size() < 2)
             continue;
 
-        if (knn[i][0].distance <
-            0.8 * knn[i][1].distance)
+        if (knn[i][0].distance < 0.75f * knn[i][1].distance)
         {
-            Point2f p =
-                kpScene[knn[i][0].trainIdx].pt;
-
-            int x = (int)p.x;
-            int y = (int)p.y;
-
-            if (x < 0 || x >= occupe.cols ||
-                y < 0 || y >= occupe.rows)
-                continue;
-
-            // Ignorer les points deja occupes
-            if (occupe.at<uchar>(y, x) == 0)
-            {
-                ptsRef.push_back(
-                    c.kp[knn[i][0].queryIdx].pt
-                );
-
-                ptsScene.push_back(p);
-            }
+            ptsRef.push_back(c.kp[knn[i][0].queryIdx].pt);
+            ptsScene.push_back(kpScene[knn[i][0].trainIdx].pt);
         }
     }
 
@@ -348,26 +338,18 @@ int appariement(
 
 
 // ======================================================
-// 8. CALCUL DE L'HOMOGRAPHIE
+// 8. HOMOGRAPHIE
 // ======================================================
 
-int calculerHomographie(
-    const vector<Point2f>& ptsRef,
+int calculerHomographie(const vector<Point2f>& ptsRef,
     const vector<Point2f>& ptsScene,
-    Mat& H)
+    Mat& H,
+    vector<uchar>& masque)
 {
     if (ptsRef.size() < 4)
         return 0;
 
-    vector<uchar> masque;
-
-    H = findHomography(
-        ptsRef, //Points de l'image de référence
-        ptsScene, //Points correspondants dans la webcam
-        RANSAC,//Méthode utilisée pour calculer l'homographie
-        3, // Seuil de distance en pixels pour accepter une correspondance comme inlier
-        masque //Indique quelles correspondances sont considérées comme des inliers
-    );
+    H = findHomography(ptsRef, ptsScene, RANSAC, 3, masque);
 
     if (H.empty())
         return 0;
@@ -375,80 +357,56 @@ int calculerHomographie(
     return countNonZero(masque);
 }
 
-
-// ======================================================
-// 9. CALCUL DES QUATRE SOMMETS
-// ======================================================
-
-void calculerSommets(
-    const Mat& H,
-    const Cible& c,
-    vector<Point2f>& sommets)
+void garderInliers(vector<Point2f>& ref, vector<Point2f>& scene,
+    const vector<uchar>& masque)
 {
-    vector<Point2f> coins(4);
-
-    coins[0] = Point2f(0, 0);
-
-    coins[1] = Point2f(
-        (float)c.image.cols,
-        0
-    );
-
-    coins[2] = Point2f(
-        (float)c.image.cols,
-        (float)c.image.rows
-    );
-
-    coins[3] = Point2f(
-        0,
-        (float)c.image.rows
-    );
-
-    perspectiveTransform(
-        coins,
-        sommets,
-        H
-    );
+    vector<Point2f> r, s;
+    for (size_t i = 0; i < masque.size(); i++)
+    {
+        if (masque[i])
+        {
+            r.push_back(ref[i]);
+            s.push_back(scene[i]);
+        }
+    }
+    ref.swap(r);
+    scene.swap(s);
 }
 
 
 // ======================================================
-// 10. VALIDATION DES SOMMETS
+// 9. SOMMETS + VALIDATION
 // ======================================================
 
-bool sommetsValides(
-    const vector<Point2f>& sommets,
-    Size taille)
+void calculerSommets(const Mat& H, const Cible& c, vector<Point2f>& sommets)
+{
+    vector<Point2f> coins(4);
+    coins[0] = Point2f(0, 0);
+    coins[1] = Point2f((float)c.image.cols, 0);
+    coins[2] = Point2f((float)c.image.cols, (float)c.image.rows);
+    coins[3] = Point2f(0, (float)c.image.rows);
+
+    perspectiveTransform(coins, sommets, H);
+}
+
+bool sommetsValides(const vector<Point2f>& sommets, Size taille)
 {
     if (sommets.size() != 4)
         return false;
 
     double aire = contourArea(sommets);
 
-    if (aire < 400 ||
-        aire > 0.9 * taille.width * taille.height)
-    {
-        return false;
-    }
-
-    // Verifier que le quadrilatere est convexe
-
-    vector<Point> points = versPoints(sommets);
-
-    if (!isContourConvex(points))
+    if (aire < 400 || aire > 0.9 * taille.width * taille.height)
         return false;
 
-    // Verifier que les sommets sont dans une zone raisonnable
+    if (!isContourConvex(versPoints(sommets)))
+        return false;
 
     for (size_t i = 0; i < sommets.size(); i++)
     {
-        if (sommets[i].x < -100 ||
-            sommets[i].x > taille.width + 100 ||
-            sommets[i].y < -100 ||
-            sommets[i].y > taille.height + 100)
-        {
+        if (sommets[i].x < -100 || sommets[i].x > taille.width + 100 ||
+            sommets[i].y < -100 || sommets[i].y > taille.height + 100)
             return false;
-        }
     }
 
     return true;
@@ -456,212 +414,172 @@ bool sommetsValides(
 
 
 // ======================================================
-// 11. TRACKING PAR FLOT OPTIQUE
+// 10. TRACKING : flot optique sur les points interieurs
+//     + re-estimation de l'homographie (plus robuste que 4 coins)
 // ======================================================
 
-bool suivreSommets(
-    const Mat& precedente,
-    const Mat& courante,
-    const vector<Point2f>& prevSommets,
-    vector<Point2f>& sommets)
+bool suivreCible(Cible& c, Size taille)
 {
-    if (prevSommets.size() != 4)
+    if (c.ptsScene.size() < (size_t)seuilInliersSuivi)
         return false;
 
+    vector<Point2f> nouveaux;
     vector<uchar> status;
     vector<float> erreurs;
 
-    calcOpticalFlowPyrLK(
-        precedente,
-        courante,
-        prevSommets,
-        sommets,
-        status,
-        erreurs
-    );
+    calcOpticalFlowPyrLK(prevPyr, currPyr, c.ptsScene, nouveaux,
+        status, erreurs, winLK, niveauxLK);
 
-    double erreurMax = 0;
-
-    for (size_t i = 0; i < sommets.size(); i++)
+    vector<Point2f> ref, scene;
+    for (size_t i = 0; i < status.size(); i++)
     {
-        if (!status[i])
-            return false;
-
-        erreurMax = max(
-            erreurMax,
-            norm(sommets[i] - prevSommets[i])
-        );
+        if (status[i] && erreurs[i] < 30)
+        {
+            ref.push_back(c.ptsRef[i]);
+            scene.push_back(nouveaux[i]);
+        }
     }
 
-    if (erreurMax > seuilFlot)
+    if ((int)ref.size() < seuilInliersSuivi)
         return false;
+
+    Mat H;
+    vector<uchar> masque;
+    int nb = calculerHomographie(ref, scene, H, masque);
+
+    if (nb < seuilInliersSuivi)
+        return false;
+
+    vector<Point2f> sommets;
+    calculerSommets(H, c, sommets);
+
+    if (!sommetsValides(sommets, taille))
+        return false;
+
+    // Saut trop grand d'une image a l'autre -> suivi perdu
+    for (size_t i = 0; i < 4; i++)
+        if (norm(sommets[i] - c.prevSommets[i]) > seuilFlot)
+            return false;
+
+    garderInliers(ref, scene, masque);
+
+    c.ptsRef = ref;
+    c.ptsScene = scene;
+    c.H = H;
+    c.sommets = sommets;
+    c.prevSommets = sommets;
 
     return true;
 }
 
 
 // ======================================================
-// 12. TRAITEMENT DE L'IMAGE
+// 11. TRAITEMENT (tracking + detection)
 // ======================================================
 
-void traiterImage(
-    const Mat& frame,
-    const Mat& gris,
-    double& tSuivi,
-    double& tDetection)
+void traiterImage(const Mat& gris, double& tSuivi, double& tDetection)
 {
-    // Masque des zones deja occupees
+    // Pyramide de l'image courante : calculee une seule fois pour toutes les cibles
+    buildOpticalFlowPyramid(gris, currPyr, winLK, niveauxLK);
 
-    Mat occupe = Mat::zeros(
-        gris.size(),
-        CV_8UC1
-    );
+    Mat occupe = Mat::zeros(gris.size(), CV_8UC1);
 
-    // --------------------------------------
-    // A. TRACKING DES IMAGES DEJA DETECTEES
-    // --------------------------------------
-
+    // --- A. TRACKING ---
     double t0 = (double)getTickCount();
 
     for (size_t i = 0; i < cibles.size(); i++)
     {
         Cible& c = cibles[i];
-
         c.visible = false;
 
-        if (c.tracking && !prevGris.empty())
+        if (!c.tracking)
+            continue;
+
+        if (prevPyrValide && suivreCible(c, gris.size()))
         {
-            vector<Point2f> nouveauxSommets;
-
-            if (suivreSommets(
-                prevGris,
-                gris,
-                c.prevSommets,
-                nouveauxSommets))
-            {
-                if (sommetsValides(
-                    nouveauxSommets,
-                    gris.size()))
-                {
-                    c.sommets = nouveauxSommets;
-
-                    c.prevSommets = nouveauxSommets;
-
-                    c.visible = true;
-
-                    c.mode = "Tracking";
-
-                    remplirZone(
-                        occupe,
-                        c.sommets
-                    );
-                }
-                else
-                {
-                    c.tracking = false;
-                }
-            }
-            else
-            {
-                c.tracking = false;
-            }
+            c.visible = true;
+            c.mode = "Tracking";
+            remplirZone(occupe, c.sommets);
+        }
+        else
+        {
+            c.tracking = false;
         }
     }
 
     tSuivi = tempsEcoule(t0);
 
-
-    // --------------------------------------
-    // B. DETECTION DES IMAGES NON SUIVIES
-    // --------------------------------------
-
+    // --- B. DETECTION (round-robin, quelques cibles par image) ---
     t0 = (double)getTickCount();
 
     if (imageCourante % periodeDetection == 0)
     {
-        vector<KeyPoint> kpScene;
+        int n = (int)cibles.size();
 
-        Mat descScene;
+        // Y a-t-il quelque chose a detecter ?
+        bool besoin = false;
+        for (int i = 0; i < n; i++)
+            if (!cibles[i].tracking) { besoin = true; break; }
 
-        bool calcule = false;
-
-        for (size_t i = 0; i < cibles.size(); i++)
+        if (besoin)
         {
-            Cible& c = cibles[i];
+            // Caracteristiques de la scene : une seule fois, hors zones deja occupees
+            Mat libre;
+            bitwise_not(occupe, libre);
 
-            // Si deja suivie, passer a la suivante
+            vector<KeyPoint> kpScene;
+            Mat descScene;
+            calculerCaracteristiques(gris, libre, kpScene, descScene);
 
-            if (c.tracking)
-                continue;
+            int tentatives = 0;
+            int dernier = curseurDetection;
 
-            // Calculer les caracteristiques de la scene
-            // une seule fois par frame
-
-            if (!calcule)
+            for (int k = 0; k < n && tentatives < maxDetectionsParImage; k++)
             {
-                calculerCaracteristiques(
-                    frame,
-                    kpScene,
-                    descScene
-                );
+                int i = (curseurDetection + k) % n;
+                Cible& c = cibles[i];
 
-                calcule = true;
-            }
+                if (c.tracking)
+                    continue;
 
-            // Apparier les descripteurs
+                tentatives++;
+                dernier = (i + 1) % n;
 
-            vector<Point2f> ptsRef;
-            vector<Point2f> ptsScene;
+                vector<Point2f> ptsRef, ptsScene;
+                c.nbAppariements = appariement(c, descScene, kpScene, ptsRef, ptsScene);
 
-            c.nbAppariements = appariement(
-                c,
-                descScene,
-                kpScene,
-                occupe,
-                ptsRef,
-                ptsScene
-            );
+                if (c.nbAppariements < seuilAppariements)
+                    continue;
 
-            // Calculer l'homographie
+                Mat H;
+                vector<uchar> masque;
+                int nbInliers = calculerHomographie(ptsRef, ptsScene, H, masque);
 
-            Mat H;
+                if (nbInliers < seuilVraisPositifs)
+                    continue;
 
-            int nbInliers = calculerHomographie(
-                ptsRef,
-                ptsScene,
-                H
-            );
-
-            if (nbInliers >= seuilVraisPositifs)
-            {
                 vector<Point2f> sommets;
+                calculerSommets(H, c, sommets);
 
-                calculerSommets(
-                    H,
-                    c,
-                    sommets
-                );
+                if (!sommetsValides(sommets, gris.size()))
+                    continue;
 
-                if (sommetsValides(
-                    sommets,
-                    gris.size()))
-                {
-                    c.sommets = sommets;
+                garderInliers(ptsRef, ptsScene, masque);
 
-                    c.prevSommets = sommets;
+                c.ptsRef = ptsRef;
+                c.ptsScene = ptsScene;
+                c.H = H;
+                c.sommets = sommets;
+                c.prevSommets = sommets;
 
-                    c.visible = true;
+                c.visible = true;
+                c.tracking = true;
+                c.mode = "Detection";
 
-                    c.tracking = true;
-
-                    c.mode = "Detection";
-
-                    remplirZone(
-                        occupe,
-                        sommets
-                    );
-                }
+                remplirZone(occupe, sommets);
             }
+
+            curseurDetection = dernier;
         }
     }
 
@@ -670,58 +588,113 @@ void traiterImage(
 
 
 // ======================================================
-// 13. AFFICHAGE DES RESULTATS
+// 12. AUGMENTATION : incrustation video (limitee a la zone utile)
 // ======================================================
 
-void dessinerCible(
-    Mat& img,
-    const Cible& c)
+bool lireVideo(Cible& c, Mat& f)
 {
-    vector<Point> contour =
-        versPoints(c.sommets);
-
-    // Contour de l'image reconnue
-
-    polylines(
-        img,
-        contour,
-        true,
-        Scalar(0, 255, 0),
-        2
-    );
-
-    // Afficher les quatre coins
-
-    for (size_t i = 0; i < contour.size(); i++)
+    if (!c.video->read(f))
     {
-        circle(
-            img,
-            contour[i],
-            5,
-            Scalar(0, 0, 255),
-            FILLED
-        );
+        c.video->set(CAP_PROP_POS_FRAMES, 0);
+        if (!c.video->read(f))
+            return false;
+    }
+    return !f.empty();
+}
+
+void lireImageVideo(Cible& c, double maintenantMs)
+{
+    if (c.video.empty() || !c.video->isOpened())
+        return;
+
+    double periode = 1000.0 / c.fpsVideo;
+    double dt = maintenantMs - c.dernierMs;
+    int n = (int)(dt / periode);
+
+    if (!c.frameVideo.empty() && n < 1)
+        return;
+
+    if (c.frameVideo.empty())
+        n = 1;
+
+    // Si la cible etait cachee longtemps, on ne rattrape pas tout
+    bool trop = n > 3;
+    if (trop) n = 1;
+
+    Mat f;
+    // On saute les images en retard (grab = decodage sans conversion)
+    for (int k = 0; k < n - 1; k++)
+    {
+        if (!c.video->grab())
+        {
+            c.video->set(CAP_PROP_POS_FRAMES, 0);
+            c.video->grab();
+        }
     }
 
-    // Nom de la reference et mode
+    if (lireVideo(c, f))
+    {
+        c.frameVideo = preparerVideo(
+            f, (double)c.image.cols / c.image.rows, largeurVideoIncr);
 
-    putText(
-        img,
-        c.nom + " : " + c.mode,
-        Point(
-            contour[0].x,
-            max(contour[0].y - 8, 12)
-        ),
-        FONT_HERSHEY_SIMPLEX,
-        0.5,
-        Scalar(0, 255, 255),
-        1
-    );
+        if (c.masqueBlanc.size() != c.frameVideo.size())
+            c.masqueBlanc = Mat(c.frameVideo.size(), CV_8UC1, Scalar(255));
+    }
+
+    c.dernierMs = trop ? maintenantMs : c.dernierMs + n * periode;
+}
+
+void augmenter(Mat& img, Cible& c, double maintenantMs)
+{
+    lireImageVideo(c, maintenantMs);
+
+    if (c.frameVideo.empty())
+        return;
+
+    // Zone englobante clippee : on ne deforme que ce qui est utile
+    Rect roi = boundingRect(c.sommets) & Rect(0, 0, img.cols, img.rows);
+    if (roi.width < 2 || roi.height < 2)
+        return;
+
+    vector<Point2f> coinsVideo(4);
+    coinsVideo[0] = Point2f(0, 0);
+    coinsVideo[1] = Point2f((float)c.frameVideo.cols, 0);
+    coinsVideo[2] = Point2f((float)c.frameVideo.cols, (float)c.frameVideo.rows);
+    coinsVideo[3] = Point2f(0, (float)c.frameVideo.rows);
+
+    Mat M = getPerspectiveTransform(coinsVideo, c.sommets);
+
+    // Decalage vers le repere du ROI
+    Mat T = (Mat_<double>(3, 3) << 1, 0, -roi.x, 0, 1, -roi.y, 0, 0, 1);
+    Mat Mr = T * M;
+
+    Mat videoDeformee, masque;
+    warpPerspective(c.frameVideo, videoDeformee, Mr, roi.size(), INTER_LINEAR);
+    warpPerspective(c.masqueBlanc, masque, Mr, roi.size(), INTER_NEAREST);
+
+    Mat zone = img(roi);
+    videoDeformee.copyTo(zone, masque);
 }
 
 
 // ======================================================
-// 14. CREATION DES RESULTATS POUR LE BINOME
+// 13. AFFICHAGE
+// ======================================================
+
+void dessinerCible(Mat& img, const Cible& c)
+{
+    vector<Point> contour = versPoints(c.sommets);
+
+    polylines(img, contour, true, Scalar(0, 255, 0), 2);
+
+    putText(img, c.nom + " : " + c.mode,
+        Point(contour[0].x, max(contour[0].y - 8, 12)),
+        FONT_HERSHEY_SIMPLEX, 0.5, Scalar(0, 255, 255), 1);
+}
+
+
+// ======================================================
+// 14. RESULTATS POUR LE BINOME (partie recalage)
 // ======================================================
 
 vector<ResultatDetection> recupererResultats()
@@ -731,13 +704,10 @@ vector<ResultatDetection> recupererResultats()
     for (size_t i = 0; i < cibles.size(); i++)
     {
         ResultatDetection r;
-
         r.id = (int)i;
-
         r.detected = cibles[i].visible;
-
         r.corners = cibles[i].sommets;
-
+        r.homography = cibles[i].H;
         resultats.push_back(r);
     }
 
@@ -751,22 +721,13 @@ vector<ResultatDetection> recupererResultats()
 
 int main()
 {
-    // Choisir ORB ou AKAZE
-
     if (!choisirDetecteur())
         return -1;
-
-
-    // Charger les images de reference
 
     if (!chargerReferences())
         return -1;
 
-    cout << "\nNombre de references chargees : "
-        << cibles.size() << endl;
-
-
-    // Ouvrir la webcam
+    cout << "\nNombre de references chargees : " << cibles.size() << endl;
 
     cap.open(0);
 
@@ -776,14 +737,20 @@ int main()
         return -1;
     }
 
-    cout << "Webcam ouverte avec succes." << endl;
-    cout << "ECHAP pour quitter." << endl;
+    // Demander directement une petite resolution a la camera
+    cap.set(CAP_PROP_FRAME_WIDTH, largeurTraitement);
+    cap.set(CAP_PROP_FRAME_HEIGHT, largeurTraitement * 3 / 4);
+    cap.set(CAP_PROP_BUFFERSIZE, 1);
 
+    cout << "Webcam ouverte. ECHAP pour quitter." << endl;
 
-    // Boucle principale
+    ofstream log("perf_" + nomAlgo + ".csv");
+    log << "image;suivi_ms;detection_ms;augmentation_ms;total_ms;fps;nb_visibles\n";
 
-    Mat frame;
-    Mat gris;
+    Mat frame, gris;
+
+    double tDebut = (double)getTickCount();
+    double tBoucle = 0;
 
     while (true)
     {
@@ -792,116 +759,80 @@ int main()
         if (frame.empty())
             break;
 
-        // Redimensionner la frame
+        double t0Boucle = (double)getTickCount();
 
-        if (largeurTraitement > 0 &&
-            frame.cols > largeurTraitement)
+        if (largeurTraitement > 0 && frame.cols > largeurTraitement)
         {
-            resize(
-                frame,
-                frame,
-                Size(
-                    largeurTraitement,
-                    frame.rows * largeurTraitement / frame.cols
-                )
-            );
+            resize(frame, frame,
+                Size(largeurTraitement,
+                    frame.rows * largeurTraitement / frame.cols),
+                0, 0, INTER_AREA);
         }
 
-        // Conversion en niveaux de gris
+        cvtColor(frame, gris, COLOR_BGR2GRAY);
 
-        cvtColor(
-            frame,
-            gris,
-            COLOR_BGR2GRAY
-        );
+        double tSuivi = 0, tDetection = 0;
 
-        // Traitement : tracking et detection
+        traiterImage(gris, tSuivi, tDetection);
 
-        double tSuivi = 0;
-        double tDetection = 0;
+        vector<ResultatDetection> resultats = recupererResultats();
 
-        traiterImage(
-            frame,
-            gris,
-            tSuivi,
-            tDetection
-        );
-
-        // Recuperer les resultats
-
-        vector<ResultatDetection> resultats =
-            recupererResultats();
-
-        // Afficher les cibles detectees
-
+        // Augmentation
+        double tAug0 = (double)getTickCount();
+        double maintenant = tempsEcoule(tDebut);
         int nbVisibles = 0;
 
         for (size_t i = 0; i < cibles.size(); i++)
         {
             if (cibles[i].visible)
             {
-                dessinerCible(
-                    frame,
-                    cibles[i]
-                );
+                augmenter(frame, cibles[i], maintenant);
+
+                if (afficherContours)
+                    dessinerCible(frame, cibles[i]);
 
                 nbVisibles++;
             }
         }
 
-        // Afficher les informations
+        double tAugmentation = tempsEcoule(tAug0);
+        double tTotal = tempsEcoule(t0Boucle);
 
-        putText(
-            frame,
-            "Images detectees : " +
-            to_string(nbVisibles) +
+        tBoucle = (tBoucle == 0) ? tTotal : 0.9 * tBoucle + 0.1 * tTotal;
+        double fps = 1000.0 / tBoucle;
+
+        log << imageCourante << ";" << tSuivi << ";" << tDetection << ";"
+            << tAugmentation << ";" << tTotal << ";"
+            << 1000.0 / max(tTotal, 0.001) << ";" << nbVisibles << "\n";
+
+        putText(frame,
+            nomAlgo + " | Images detectees : " + to_string(nbVisibles) +
             " / " + to_string(cibles.size()),
-            Point(10, 25),
-            FONT_HERSHEY_SIMPLEX,
-            0.6,
-            Scalar(0, 0, 255),
-            2
-        );
+            Point(10, 25), FONT_HERSHEY_SIMPLEX, 0.6, Scalar(0, 0, 255), 2);
 
-        putText(
-            frame,
-            "Tracking : " + to_string((int)tSuivi) + " ms",
-            Point(10, 50),
-            FONT_HERSHEY_SIMPLEX,
-            0.5,
-            Scalar(255, 0, 0),
-            2
-        );
+        putText(frame,
+            "Tracking : " + to_string((int)tSuivi) + " ms | Detection : " +
+            to_string((int)tDetection) + " ms | Aug. : " +
+            to_string((int)tAugmentation) + " ms",
+            Point(10, 50), FONT_HERSHEY_SIMPLEX, 0.45, Scalar(255, 0, 0), 1);
 
-        putText(
-            frame,
-            "Detection : " + to_string((int)tDetection) + " ms",
-            Point(10, 75),
-            FONT_HERSHEY_SIMPLEX,
-            0.5,
-            Scalar(255, 0, 0),
-            2
-        );
+        putText(frame, format("%.1f FPS (%.1f ms)", fps, tBoucle),
+            Point(10, 75), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(0, 255, 255), 2);
 
-        imshow(
-            "Detection et Tracking Multi-Images",
-            frame
-        );
+        imshow("Detection et Tracking Multi-Images", frame);
 
-        // Memoriser la frame precedente
-
-        prevGris = gris.clone();
+        // La pyramide courante devient la precedente (sans recalcul)
+        prevPyr.swap(currPyr);
+        prevPyrValide = true;
 
         imageCourante++;
-
-        // ECHAP pour quitter
 
         if (waitKey(1) == 27)
             break;
     }
 
+    log.close();
     cap.release();
-
     destroyAllWindows();
 
     return 0;
